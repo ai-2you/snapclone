@@ -17,7 +17,7 @@ use crate::{capture, editor_window};
 const FILE_FORMATS: &[Format] = &[Format::Png, Format::Jpeg];
 const FILE_UNSUPPORTED: &str = "Solo se pueden abrir imágenes PNG o JPEG";
 /// Far above any screenshot; stops a mistaken drop from reading gigabytes into memory.
-const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// No display goes beyond 3x; a print-resolution `pHYs` must not blow up the styling.
 const MAX_SCALE: f64 = 3.0;
@@ -68,7 +68,7 @@ pub fn prepare(bytes: Vec<u8>, accepted: &[Format], unsupported: &str) -> Result
     Ok((png, scale))
 }
 
-fn check_size(width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn check_size(width: u32, height: u32) -> Result<(), String> {
     if width == 0 || height == 0 {
         return Err("La imagen está vacía".into());
     }
@@ -88,6 +88,13 @@ pub(crate) fn decode_limits() -> xcap::image::Limits {
     limits.max_image_height = Some(MAX_SIDE);
     limits.max_alloc = Some(MAX_PIXELS * 4 + 256 * 1024 * 1024);
     limits
+}
+
+/// Reads only the declared dimensions, without decoding pixels. `native` stays private; this is
+/// the one thing another module (`wallpaper`'s Windows thumbnail) needs from it, to check an
+/// untrusted local image's size before decoding it, the same way `prepare` does.
+pub(crate) fn header_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    native::header_size(bytes)
 }
 
 /// Writes the PNG to `captures/` and hands it to the editor like a fresh capture.

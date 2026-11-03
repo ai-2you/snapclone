@@ -74,6 +74,13 @@ windows = { version = "0.62", features = [
     "Storage",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",
+    # Gaps menores (Fase 10): abrir carpeta/archivo sin subproceso (SHOpenFolderAndSelectItems,
+    # SHParseDisplayName, CoInitializeEx/CoTaskMemFree), "Enviar comentarios" (ShellExecuteW),
+    # fondo de escritorio (SystemParametersInfoW, ya cubierto por Win32_UI_WindowsAndMessaging)
+    # y sonido de captura (PlaySoundW).
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_UI_Shell_Common",
 ] }
 # Ya transitiva vía wry/tauri-runtime-wry a esta misma versión — declararla directamente solo
 # da acceso a sus tipos (ICoreWebView2Settings3) para desactivar los aceleradores de teclado

@@ -13,6 +13,7 @@ const SOUND_KEY: &str = "soundOn";
 const CLOSE_AFTER_COPY_KEY: &str = "closeAfterCopy";
 const HIDE_WINDOWS_KEY: &str = "hideWindowsOnCapture";
 const HISTORY_EVENT: &str = "open-history";
+#[cfg(target_os = "macos")]
 const SCREEN_CAPTURE_SOUND: &str =
     "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Screen Capture.aif";
 
@@ -156,6 +157,7 @@ pub fn open_history_folder(app: AppHandle) -> Result<(), String> {
 }
 
 /// The system screenshot sound, played without waiting for it when the user enabled it.
+#[cfg(target_os = "macos")]
 pub fn play_capture_sound(app: &AppHandle) {
     if !toggle(app, Toggle::SoundOn) {
         return;
@@ -167,4 +169,25 @@ pub fn play_capture_sound(app: &AppHandle) {
             Ok(_) => {}
         }
     });
+}
+
+/// Same, via `winmm`'s `PlaySoundW` with `SND_MEMORY` over a `.wav` baked into the binary
+/// (`include_bytes!`, so it is always `'static` — required for `SND_ASYNC`, which keeps playing
+/// after this function returns). No new dependency: `windows` already covers `winmm.dll`.
+#[cfg(target_os = "windows")]
+pub fn play_capture_sound(app: &AppHandle) {
+    if !toggle(app, Toggle::SoundOn) {
+        return;
+    }
+    const SOUND: &[u8] = include_bytes!("../assets/capture-sound.wav");
+    use windows::{
+        Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY},
+        core::PCWSTR,
+    };
+    // SAFETY: `SOUND` is `'static` (baked into the binary) and `SND_MEMORY` tells `PlaySoundW`
+    // to treat the pointer as an in-memory WAV image, never as a path string.
+    let played = unsafe { PlaySoundW(PCWSTR(SOUND.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC) };
+    if !played.as_bool() {
+        eprintln!("capture sound could not be played");
+    }
 }
