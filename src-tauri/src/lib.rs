@@ -44,6 +44,9 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         editor_window::show(app, false);
     }));
+    // Tracks the most recent "copy" so a slow large one can never overwrite a faster, later one.
+    #[cfg(windows)]
+    let builder = builder.manage(export::CopyGeneration::default());
     builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(capture::Captures::default())

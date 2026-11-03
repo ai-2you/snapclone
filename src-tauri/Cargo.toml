@@ -59,9 +59,17 @@ tauri-plugin-single-instance = "2"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_Graphics_Gdi",
 ] }
 # Ya transitiva vía wry/tauri-runtime-wry a esta misma versión — declararla directamente solo
 # da acceso a sus tipos (ICoreWebView2Settings3) para desactivar los aceleradores de teclado
 # del navegador de WebView2 (F5/Ctrl+R recargarían la página y perderían la edición en curso).
 # No añade ninguna copia nueva al árbol de dependencias.
 webview2-com = "0.39.1"
+# Escribir en el portapapeles (Copiar): API simple, retries internos ante contención, y la
+# extensión `SetExtWindows` para excluir del Historial del portapapeles y de su sincronización
+# en la nube. Leer (Pegar) usa la API Win32 directa de arriba, no esta crate — ver Fase 5.
+arboard = "3.7.0"

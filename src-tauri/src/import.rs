@@ -78,6 +78,18 @@ fn check_size(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Decoder limits for images this app accepts but `image`'s own default `max_alloc` (512MiB)
+/// would refuse: a legitimate capture up to `MAX_PIXELS` needs close to 1GiB of RGBA. Shared by
+/// every decode path (clipboard copy/paste, file conversion) so the cap stays in one place.
+pub(crate) fn decode_limits() -> xcap::image::Limits {
+    // `Limits` is `#[non_exhaustive]`: built from `default()`, then its public fields are set.
+    let mut limits = xcap::image::Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_PIXELS * 4 + 64 * 1024 * 1024);
+    limits
+}
+
 /// Writes the PNG to `captures/` and hands it to the editor like a fresh capture.
 fn store(app: &AppHandle, png: &[u8], scale: f64) -> Result<(), String> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -153,11 +165,20 @@ pub fn open_image_file(app: AppHandle) {
 
 /// Opens the image on the pasteboard. AppKit is read here, so call it on the main thread
 /// (menu events and synchronous commands run there).
+#[cfg(target_os = "macos")]
 pub fn open_clipboard(app: &AppHandle) {
     match native::pasteboard_image() {
         Some(bytes) => open_with(app, move || Ok(bytes), &[Format::Png, Format::Tiff], "El portapapeles no tiene una imagen PNG o TIFF"),
         None => editor_window::notify(app, "El portapapeles no tiene ninguna imagen", true),
     }
+}
+
+/// Opens the image on the pasteboard. Unlike AppKit, nothing here needs the main thread: the
+/// whole read (and, on Windows, the DIB→PNG conversion) runs inside `open_with`'s own
+/// `spawn_blocking`.
+#[cfg(not(target_os = "macos"))]
+pub fn open_clipboard(app: &AppHandle) {
+    open_with(app, native::pasteboard_image, &[Format::Png], "El portapapeles no tiene una imagen que se pueda abrir");
 }
 
 /// ⌘V in the editor. Synchronous, so it runs on the main thread like AppKit expects.
@@ -205,15 +226,382 @@ mod native {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod native {
+    use std::time::Duration;
+
+    use windows::{
+        Win32::Foundation::{HANDLE, HGLOBAL},
+        Win32::Graphics::Gdi::{BI_BITFIELDS, BI_RGB},
+        Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW},
+        Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+        Win32::System::Ole::{CF_DIB, CF_DIBV5},
+        core::HSTRING,
+    };
+    use xcap::image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    /// Without ImageIO the PNG header check after conversion is the only one.
+    pub fn header_size(_bytes: &[u8]) -> Option<(u32, u32)> {
+        Some((1, 1))
+    }
+
+    pub fn to_png(_bytes: &[u8]) -> Result<Vec<u8>, String> {
+        Err("converting images is only implemented on macOS".into())
+    }
+
+    const BAD_IMAGE: &str = "La imagen está dañada o no se puede leer";
+    const UNSUPPORTED_DIB: &str = "El portapapeles tiene una imagen en un formato que no se puede abrir";
+
+    /// Holds the clipboard open for this thread and guarantees it is closed again, even on an
+    /// early return. `OpenClipboard` is only tied to the thread that calls it, not the main one.
+    struct ClipboardGuard;
+
+    impl ClipboardGuard {
+        /// A couple of short retries: another app can briefly be holding the clipboard too.
+        fn open() -> Result<Self, String> {
+            for attempt in 0..3 {
+                // SAFETY: no window needs to own the clipboard just to read from it.
+                if unsafe { OpenClipboard(None) }.is_ok() {
+                    return Ok(Self);
+                }
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err("No se pudo leer el portapapeles".into())
+        }
+    }
+
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            // SAFETY: only reached after a successful `OpenClipboard` on this same thread.
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+
+    /// A locked view of a clipboard global block. Never copies more than the caller asks for,
+    /// so the size can be checked from a short header before any full-size allocation happens.
+    struct GlobalBytes {
+        handle: HGLOBAL,
+        ptr: *const u8,
+        len: usize,
+    }
+
+    impl GlobalBytes {
+        /// `handle` must come straight from `GetClipboardData` while the clipboard is open; it
+        /// stays owned by the clipboard and must never be freed here.
+        fn lock(handle: HANDLE) -> Result<Self, String> {
+            let handle = HGLOBAL(handle.0);
+            // SAFETY: `handle` is a live global block owned by the open clipboard.
+            let len = unsafe { GlobalSize(handle) };
+            // SAFETY: same block; locking it for reading is always valid while it is owned.
+            let ptr = unsafe { GlobalLock(handle) };
+            if ptr.is_null() {
+                return Err("No se pudo leer el portapapeles".into());
+            }
+            Ok(Self { handle, ptr: ptr as *const u8, len })
+        }
+
+        fn head(&self, len: usize) -> Result<&[u8], String> {
+            if self.len < len {
+                return Err(BAD_IMAGE.into());
+            }
+            // SAFETY: `len` was just checked against the block's own reported size.
+            Ok(unsafe { std::slice::from_raw_parts(self.ptr, len) })
+        }
+
+        fn check_len(&self, max: u64) -> Result<(), String> {
+            if self.len as u64 > max {
+                return Err("La imagen es demasiado grande para editarla".into());
+            }
+            Ok(())
+        }
+
+        fn to_vec(&self) -> Vec<u8> {
+            // SAFETY: `self.len` is exactly the size Windows reported for this block.
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }.to_vec()
+        }
+    }
+
+    impl Drop for GlobalBytes {
+        fn drop(&mut self) {
+            // SAFETY: `self.handle` was locked exactly once by `lock`, matched by this unlock.
+            let _ = unsafe { GlobalUnlock(self.handle) };
+        }
+    }
+
+    fn clipboard_data(format: u32) -> Option<HANDLE> {
+        // SAFETY: only called while a `ClipboardGuard` holds the clipboard open.
+        unsafe { GetClipboardData(format) }.ok()
+    }
+
+    /// The format name browsers, Recortes and `arboard` all register PNG under.
+    fn png_format() -> u32 {
+        // SAFETY: a plain format-name lookup; registers the name on first use, like any app.
+        unsafe { RegisterClipboardFormatW(&HSTRING::from("PNG")) }
+    }
+
+    fn png_ihdr_size(head: &[u8]) -> Result<(u32, u32), String> {
+        const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+        if head.len() < 24 || !head.starts_with(SIGNATURE) || &head[12..16] != b"IHDR" {
+            return Err(BAD_IMAGE.into());
+        }
+        let width = u32::from_be_bytes(head[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(head[20..24].try_into().unwrap());
+        Ok((width, height))
+    }
+
+    /// The `BITMAPINFOHEADER`/`BITMAPV5HEADER` fields this needs; both share the same first 40
+    /// bytes. A negative height means the rows are stored top-down instead of bottom-up.
+    struct DibHeader {
+        width: u32,
+        height: u32,
+        top_down: bool,
+        bit_count: u16,
+        compression: u32,
+    }
+
+    fn dib_header(head: &[u8]) -> Result<DibHeader, String> {
+        if head.len() < 40 {
+            return Err(BAD_IMAGE.into());
+        }
+        let width = i32::from_le_bytes(head[4..8].try_into().unwrap());
+        let height = i32::from_le_bytes(head[8..12].try_into().unwrap());
+        let bit_count = u16::from_le_bytes(head[14..16].try_into().unwrap());
+        let compression = u32::from_le_bytes(head[16..20].try_into().unwrap());
+        if width <= 0 || height == 0 {
+            return Err(BAD_IMAGE.into());
+        }
+        Ok(DibHeader { width: width as u32, height: height.unsigned_abs(), top_down: height < 0, bit_count, compression })
+    }
+
+    /// `BI_BITFIELDS` colour masks: embedded fields on a V4/V5 header, or three trailing `DWORD`s
+    /// right after an old-style 40-byte `BITMAPINFOHEADER` (which never carries an alpha mask).
+    fn bitfield_masks(dib: &[u8], bi_size: usize) -> Option<(u32, u32, u32, u32)> {
+        let read = |offset: usize| -> Option<u32> { Some(u32::from_le_bytes(dib.get(offset..offset + 4)?.try_into().ok()?)) };
+        if bi_size >= 56 {
+            Some((read(40)?, read(44)?, read(48)?, read(52)?))
+        } else {
+            Some((read(40)?, read(44)?, read(48)?, 0))
+        }
+    }
+
+    /// Pulls an 8-bit channel out of a packed pixel using its mask; a zero mask (only ever the
+    /// alpha one) means the channel does not exist, so `default` (255, fully opaque) is used.
+    fn channel(pixel: u32, mask: u32, default: u8) -> u8 {
+        if mask == 0 {
+            return default;
+        }
+        let shift = mask.trailing_zeros();
+        let width = 32 - mask.leading_zeros() - shift;
+        let value = (pixel & mask) >> shift;
+        if width >= 8 { (value >> (width - 8)) as u8 } else { ((value * 255) / ((1u32 << width) - 1).max(1)) as u8 }
+    }
+
+    /// `dib` is the full clipboard block (header, any colour masks, then pixel rows); only
+    /// 24bpp/32bpp `BI_RGB` and 32bpp `BI_BITFIELDS` are handled, which covers Paint, Word and
+    /// every other real sender of plain DIBs — anything else is refused with a clear message.
+    fn dib_to_png(header: &DibHeader, dib: &[u8]) -> Result<Vec<u8>, String> {
+        let bi_size = u32::from_le_bytes(dib.get(0..4).and_then(|s| s.try_into().ok()).ok_or(BAD_IMAGE)?) as usize;
+        let width = header.width as usize;
+        let height = header.height as usize;
+        let bytes_per_pixel = match header.bit_count {
+            24 => 3,
+            32 => 4,
+            _ => return Err(UNSUPPORTED_DIB.into()),
+        };
+        let masks = if header.compression == BI_BITFIELDS.0 {
+            if header.bit_count != 32 {
+                return Err(UNSUPPORTED_DIB.into());
+            }
+            Some(bitfield_masks(dib, bi_size).ok_or(BAD_IMAGE)?)
+        } else if header.compression == BI_RGB.0 {
+            None
+        } else {
+            return Err(UNSUPPORTED_DIB.into());
+        };
+        let data_offset = if masks.is_some() && bi_size == 40 { bi_size + 12 } else { bi_size };
+        // Rows are padded to a 4-byte boundary; only 24bpp rows are ever not already aligned.
+        let row_len = (width * bytes_per_pixel).div_ceil(4) * 4;
+        let pixels = dib.get(data_offset..).ok_or(BAD_IMAGE)?;
+        if pixels.len() < row_len * height {
+            return Err(BAD_IMAGE.into());
+        }
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 0..height {
+            let source_row = if header.top_down { y } else { height - 1 - y };
+            let row = &pixels[source_row * row_len..source_row * row_len + width * bytes_per_pixel];
+            for x in 0..width {
+                let pixel = &row[x * bytes_per_pixel..x * bytes_per_pixel + bytes_per_pixel];
+                let out = &mut rgba[(y * width + x) * 4..(y * width + x) * 4 + 4];
+                match masks {
+                    None => out.copy_from_slice(&[pixel[2], pixel[1], pixel[0], 255]),
+                    Some((red, green, blue, alpha)) => {
+                        let packed = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                        out.copy_from_slice(&[channel(packed, red, 0), channel(packed, green, 0), channel(packed, blue, 0), channel(packed, alpha, 255)]);
+                    }
+                }
+            }
+        }
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, header.width, header.height, ExtendedColorType::Rgba8)
+            .map_err(|error| error.to_string())?;
+        Ok(png)
+    }
+
+    /// Runs inside `open_with`'s `spawn_blocking`, never on the main thread. Never decodes a
+    /// full image before checking its declared size: the clipboard is untrusted input, since any
+    /// app can have put something oversized there (OWASP A10:2025, exceptional-condition DoS).
+    pub fn pasteboard_image() -> Result<Vec<u8>, String> {
+        let _clipboard = ClipboardGuard::open()?;
+        if let Some(handle) = clipboard_data(png_format()) {
+            let locked = GlobalBytes::lock(handle)?;
+            let (width, height) = png_ihdr_size(locked.head(24)?)?;
+            super::check_size(width, height)?;
+            locked.check_len(super::MAX_FILE_BYTES)?;
+            return Ok(locked.to_vec());
+        }
+        if let Some(handle) = clipboard_data(u32::from(CF_DIBV5.0)).or_else(|| clipboard_data(u32::from(CF_DIB.0))) {
+            let locked = GlobalBytes::lock(handle)?;
+            let header = dib_header(locked.head(40)?)?;
+            super::check_size(header.width, header.height)?;
+            locked.check_len(super::MAX_FILE_BYTES)?;
+            let dib = locked.to_vec();
+            drop(locked);
+            return dib_to_png(&header, &dib);
+        }
+        Err("El portapapeles no tiene ninguna imagen".into())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample_png_head() -> Vec<u8> {
+            use xcap::image::{Rgba, RgbaImage};
+            let path = std::env::temp_dir().join(format!("snapclone-clipboard-{}.png", uuid::Uuid::new_v4()));
+            crate::images::write_png(&path, &RgbaImage::from_pixel(5, 3, Rgba([10, 20, 30, 255]))).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            bytes
+        }
+
+        #[test]
+        fn png_ihdr_size_reads_a_real_header() {
+            let png = sample_png_head();
+            assert_eq!(png_ihdr_size(&png[..24]), Ok((5, 3)));
+        }
+
+        #[test]
+        fn png_ihdr_size_rejects_truncated_or_foreign_bytes() {
+            let png = sample_png_head();
+            assert!(png_ihdr_size(&png[..10]).is_err());
+            assert!(png_ihdr_size(b"not a png at all, just text").is_err());
+        }
+
+        fn bmp_header(width: i32, height: i32, bit_count: u16, compression: u32) -> Vec<u8> {
+            let mut head = vec![0u8; 40];
+            head[0..4].copy_from_slice(&40u32.to_le_bytes());
+            head[4..8].copy_from_slice(&width.to_le_bytes());
+            head[8..12].copy_from_slice(&height.to_le_bytes());
+            head[14..16].copy_from_slice(&bit_count.to_le_bytes());
+            head[16..20].copy_from_slice(&compression.to_le_bytes());
+            head
+        }
+
+        #[test]
+        fn dib_header_reads_width_height_and_bottom_up_by_default() {
+            let header = dib_header(&bmp_header(4, 3, 24, BI_RGB.0)).unwrap();
+            assert_eq!((header.width, header.height, header.top_down), (4, 3, false));
+        }
+
+        #[test]
+        fn dib_header_treats_a_negative_height_as_top_down() {
+            let header = dib_header(&bmp_header(4, -3, 24, BI_RGB.0)).unwrap();
+            assert_eq!((header.width, header.height, header.top_down), (4, 3, true));
+        }
+
+        #[test]
+        fn dib_header_rejects_a_truncated_or_empty_header() {
+            assert!(dib_header(&bmp_header(4, 3, 24, BI_RGB.0)[..30]).is_err());
+            assert!(dib_header(&bmp_header(0, 3, 24, BI_RGB.0)).is_err());
+            assert!(dib_header(&bmp_header(4, 0, 24, BI_RGB.0)).is_err());
+        }
+
+        /// A 2×2 24bpp BGR DIB, bottom-up, with the 4-byte row padding every real DIB has.
+        fn dib_24bpp(pixels: [[u8; 3]; 4]) -> Vec<u8> {
+            let mut dib = bmp_header(2, 2, 24, BI_RGB.0);
+            for row in [[pixels[2], pixels[3]], [pixels[0], pixels[1]]] {
+                for [b, g, r] in row {
+                    dib.extend_from_slice(&[b, g, r]);
+                }
+                dib.extend_from_slice(&[0, 0]); // pad 6 bytes up to the next multiple of 4
+            }
+            dib
+        }
+
+        #[test]
+        fn dib_to_png_decodes_24bpp_bgr_bottom_up() {
+            let red = [0, 0, 255];
+            let green = [0, 255, 0];
+            let blue = [255, 0, 0];
+            let white = [255, 255, 255];
+            let dib = dib_24bpp([red, green, blue, white]);
+            let header = dib_header(&dib).unwrap();
+            let png = dib_to_png(&header, &dib).unwrap();
+            let image = xcap::image::load_from_memory(&png).unwrap().to_rgba8();
+            assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+            assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 255]);
+            assert_eq!(image.get_pixel(0, 1).0, [0, 0, 255, 255]);
+            assert_eq!(image.get_pixel(1, 1).0, [255, 255, 255, 255]);
+        }
+
+        #[test]
+        fn dib_to_png_decodes_32bpp_bitfields_with_alpha() {
+            // A V4/V5-shaped header (`biSize` >= 56): the colour masks are embedded fields, not
+            // a trailing table, so the pixel data starts right after the header, not 12 bytes in.
+            let mut dib = bmp_header(2, 1, 32, BI_BITFIELDS.0);
+            dib[0..4].copy_from_slice(&108u32.to_le_bytes());
+            dib.resize(108, 0);
+            dib[40..44].copy_from_slice(&0x00FF_0000u32.to_le_bytes()); // red mask
+            dib[44..48].copy_from_slice(&0x0000_FF00u32.to_le_bytes()); // green mask
+            dib[48..52].copy_from_slice(&0x0000_00FFu32.to_le_bytes()); // blue mask
+            dib[52..56].copy_from_slice(&0xFF00_0000u32.to_le_bytes()); // alpha mask
+            dib.extend_from_slice(&0x80FF_0000u32.to_le_bytes()); // pixel (0,0): opaque-ish red
+            dib.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // pixel (1,0): transparent green
+            let header = dib_header(&dib).unwrap();
+            let png = dib_to_png(&header, &dib).unwrap();
+            let image = xcap::image::load_from_memory(&png).unwrap().to_rgba8();
+            assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 128]);
+            assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 0]);
+        }
+
+        #[test]
+        fn dib_to_png_rejects_unsupported_bit_depths_and_compression() {
+            let eight_bpp = dib_header(&bmp_header(2, 2, 8, BI_RGB.0)).unwrap();
+            assert!(dib_to_png(&eight_bpp, &bmp_header(2, 2, 8, BI_RGB.0)).is_err());
+            let rle = dib_header(&bmp_header(2, 2, 24, 2)).unwrap(); // an RLE compression value
+            assert!(dib_to_png(&rle, &bmp_header(2, 2, 24, 2)).is_err());
+        }
+
+        #[test]
+        fn a_header_declaring_an_enormous_image_is_rejected_before_any_large_allocation() {
+            let huge = dib_header(&bmp_header(30_000, 30_000, 24, BI_RGB.0)).unwrap();
+            assert!(super::super::check_size(huge.width, huge.height).is_err());
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod native {
     /// Without ImageIO the PNG header check after conversion is the only one.
     pub fn header_size(_bytes: &[u8]) -> Option<(u32, u32)> {
         Some((1, 1))
     }
 
-    pub fn pasteboard_image() -> Option<Vec<u8>> {
-        None
+    pub fn pasteboard_image() -> Result<Vec<u8>, String> {
+        Err("El portapapeles no tiene ninguna imagen".into())
     }
 
     pub fn to_png(_bytes: &[u8]) -> Result<Vec<u8>, String> {
