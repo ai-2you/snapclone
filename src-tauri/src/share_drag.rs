@@ -2,9 +2,9 @@
 //! handed to the macOS share menu or dragged out of the editor as a PNG file. Both commands
 //! are synchronous, so Tauri runs them on the main thread, as AppKit requires.
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
-use crate::{capture::EDITOR_WINDOW, output};
+use crate::output;
 
 /// Where the share button is, in CSS pixels from the top-left of the editor's page.
 #[derive(serde::Deserialize, Clone, Copy)]
@@ -23,18 +23,16 @@ impl Anchor {
     }
 }
 
-fn editor_ns_window(app: &AppHandle) -> Result<usize, String> {
-    let window = app.get_webview_window(EDITOR_WINDOW).ok_or("the editor window is gone")?;
-    window.ns_window().map(|pointer| pointer as usize).map_err(|error| error.to_string())
-}
-
 #[tauri::command]
 pub fn share_export(app: AppHandle, anchor: Anchor) -> Result<(), String> {
     if !anchor.is_valid() {
         return Err("invalid share button position".into());
     }
     let path = output::export_file(&app)?;
-    macos::share(editor_ns_window(&app)?, &path, anchor)
+    #[cfg(target_os = "macos")]
+    { macos::share(&app, &path, anchor) }
+    #[cfg(not(target_os = "macos"))]
+    { other::share(&app, &path, anchor) }
 }
 
 /// Starts dragging the prepared file. Returns false, without an error, when the mouse button
@@ -42,12 +40,17 @@ pub fn share_export(app: AppHandle, anchor: Anchor) -> Result<(), String> {
 #[tauri::command]
 pub fn drag_export(app: AppHandle) -> Result<bool, String> {
     let path = output::export_file(&app)?;
-    macos::drag(editor_ns_window(&app)?, &path)
+    #[cfg(target_os = "macos")]
+    { macos::drag(&app, &path) }
+    #[cfg(not(target_os = "macos"))]
+    { other::drag(&app, &path) }
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
     use std::{cell::RefCell, path::Path};
+
+    use tauri::{AppHandle, Manager};
 
     use objc2::{
         AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -60,10 +63,17 @@ mod macos {
     };
     use objc2_foundation::{NSArray, NSPoint, NSProcessInfo, NSRect, NSRectEdge, NSSize, NSString, NSURL};
 
+    use crate::capture::EDITOR_WINDOW;
+
     use super::Anchor;
 
     /// Side of the image shown under the pointer while dragging, in points.
     const DRAG_PREVIEW_SIDE: f64 = 160.0;
+
+    fn editor_ns_window(app: &AppHandle) -> Result<usize, String> {
+        let window = app.get_webview_window(EDITOR_WINDOW).ok_or("the editor window is gone")?;
+        window.ns_window().map(|pointer| pointer as usize).map_err(|error| error.to_string())
+    }
 
     define_class!(
         // SAFETY: NSObject has no subclassing requirements and this class has no Drop.
@@ -142,8 +152,8 @@ mod macos {
         Ok(NSURL::fileURLWithPath(&NSString::from_str(text)))
     }
 
-    pub fn share(ns_window: usize, path: &Path, anchor: Anchor) -> Result<(), String> {
-        let (_mtm, _window, view) = editor_window(ns_window)?;
+    pub fn share(app: &AppHandle, path: &Path, anchor: Anchor) -> Result<(), String> {
+        let (_mtm, _window, view) = editor_window(editor_ns_window(app)?)?;
         let url = file_url(path)?;
         let item: &AnyObject = &url;
         let items = NSArray::from_slice(&[item]);
@@ -158,8 +168,8 @@ mod macos {
         Ok(())
     }
 
-    pub fn drag(ns_window: usize, path: &Path) -> Result<bool, String> {
-        let (mtm, window, view) = editor_window(ns_window)?;
+    pub fn drag(app: &AppHandle, path: &Path) -> Result<bool, String> {
+        let (mtm, window, view) = editor_window(editor_ns_window(app)?)?;
         if !left_button_pressed() {
             return Ok(false);
         }
@@ -182,15 +192,19 @@ mod macos {
     }
 }
 
+/// Placeholder for every non-macOS platform, selected until Phase 4 adds a real `mod windows`
+/// (same `share`/`drag(app: &AppHandle, ...)` contract) and the dispatch above is extended.
 #[cfg(not(target_os = "macos"))]
-mod macos {
+mod other {
     use std::path::Path;
 
-    pub fn share(_ns_window: usize, _path: &Path, _anchor: super::Anchor) -> Result<(), String> {
+    use tauri::AppHandle;
+
+    pub fn share(_app: &AppHandle, _path: &Path, _anchor: super::Anchor) -> Result<(), String> {
         Err("sharing is only implemented on macOS".into())
     }
 
-    pub fn drag(_ns_window: usize, _path: &Path) -> Result<bool, String> {
+    pub fn drag(_app: &AppHandle, _path: &Path) -> Result<bool, String> {
         Err("dragging out is only implemented on macOS".into())
     }
 }

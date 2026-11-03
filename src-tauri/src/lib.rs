@@ -2,6 +2,9 @@ mod app_settings;
 mod capture;
 #[cfg(target_os = "macos")]
 mod capture_below;
+#[cfg(not(target_os = "macos"))]
+#[path = "capture_below_other.rs"]
+mod capture_below;
 mod crosshair;
 mod editor_window;
 mod export;
@@ -30,7 +33,16 @@ use tauri_plugin_global_shortcut::ShortcutState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Relaunching while already running must bring the editor forward instead of starting a
+    // second process. macOS already gets this for free via RunEvent::Reopen, so the plugin is
+    // registered only on Windows; it must be the first plugin so it intercepts the relaunch
+    // before the rest of `setup()` runs twice.
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        editor_window::show(app, false);
+    }));
+    builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(capture::Captures::default())
         .manage(export::PendingSave::default())
@@ -142,12 +154,18 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| match event {
-            // A click on the Dock icon, or opening the app again while it runs.
+        .run(|app, event| {
+            // Unused on non-macOS, where every arm below ignores `app`.
+            let _ = &app;
+            match event {
+            // A click on the Dock icon, or opening the app again while it runs. Windows gets the
+            // equivalent via tauri-plugin-single-instance, registered above.
+            #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => editor_window::show(app, false),
             // Without a code, the last window closing asked to exit; the app lives on in the
             // menu bar. "Salir del todo" exits with a code, which is let through.
             RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
             _ => {}
+            }
         });
 }

@@ -47,3 +47,16 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAppl
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSObject", "NSProcessInfo", "NSRange", "NSString", "NSURL"] }
 objc2-vision = { version = "0.3", default-features = false, features = ["VNRequest", "VNRecognizeTextRequest", "VNRequestHandler", "VNObservation", "VNTypes", "objc2-core-foundation"] }
+
+[target.'cfg(windows)'.dependencies]
+# Evita que relanzar Snapclone mientras ya corre abra un segundo proceso (macOS resuelve esto
+# con RunEvent::Reopen).
+tauri-plugin-single-instance = "2"
+# Entrada canónica única para toda la crate `windows` en Windows: cada fase posterior (OCR,
+# compartir/arrastrar, portapapeles, fondo/sonido/explorer) AMPLÍA esta misma entrada con más
+# features en vez de declarar una nueva. Hoy solo se necesita GetCursorPos (puntero global,
+# movido aquí desde la Fase 10 para compartir el modelo de coordenadas).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

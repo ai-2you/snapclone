@@ -10,11 +10,12 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -120,17 +121,30 @@ pub fn begin(app: &AppHandle, target: Target) -> Result<(), String> {
 /// number: frames are captured below it.
 fn open_windows(app: &AppHandle, framed: Rect, toolbar: Rect) -> Result<u32, String> {
     let frame = builder(app, FRAME_WINDOW, framed).transparent(true).build().map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    crate::selector::place_physical(&frame, framed.x, framed.y, framed.width, framed.height).map_err(|error| error.to_string())?;
     frame.set_ignore_cursor_events(true).map_err(|error| error.to_string())?;
     // A click on a button still works without the toolbar ever becoming the key window.
     let bar = builder(app, TOOLBAR_WINDOW, toolbar).accept_first_mouse(true).build().map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    crate::selector::place_physical(&bar, toolbar.x, toolbar.y, toolbar.width, toolbar.height).map_err(|error| error.to_string())?;
     arrange(app, frame, bar)
 }
 
+/// `rect` is this window's native-unit geometry (points on macOS, physical pixels on Windows
+/// — see the HiDPI note in the port plan). On macOS the logical builder methods below position
+/// it directly, exactly as before. On Windows they are skipped — `open_windows` repositions
+/// the built window in physical pixels instead via `selector::place_physical`, which bypasses
+/// logical/DPI conversion entirely (needed because per-monitor DPI does not compose into one
+/// logical space across monitors); the window stays hidden (`focused(false)`, never shown
+/// before that call) so nothing flashes at the wrong spot in between.
 fn builder<'a>(app: &'a AppHandle, label: &str, rect: Rect) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
-    WebviewWindowBuilder::new(app, label, WebviewUrl::App(PAGE.into()))
+    // Only read on macOS, where the builder positions the window directly; `open_windows`
+    // repositions it afterwards on every other platform.
+    let _ = rect;
+    #[allow(unused_mut)]
+    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(PAGE.into()))
         .title("Snapclone")
-        .position(f64::from(rect.x), f64::from(rect.y))
-        .inner_size(f64::from(rect.width), f64::from(rect.height))
         .decorations(false)
         .resizable(false)
         .shadow(false)
@@ -138,7 +152,12 @@ fn builder<'a>(app: &'a AppHandle, label: &str, rect: Rect) -> WebviewWindowBuil
         .skip_taskbar(true)
         .visible_on_all_workspaces(true)
         .focused(false)
-        .focusable(false)
+        .focusable(false);
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.position(f64::from(rect.x), f64::from(rect.y)).inner_size(f64::from(rect.width), f64::from(rect.height));
+    }
+    builder
 }
 
 /// Puts the frame above every app's windows and the toolbar above the frame, so capturing
