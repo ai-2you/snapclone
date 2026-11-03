@@ -192,9 +192,19 @@ fn arrange(app: &AppHandle, frame: WebviewWindow, toolbar: WebviewWindow) -> Res
     receiver.recv().map_err(|error| error.to_string())?
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Phase 2 spike (step 1a): the frame sits `EDGE` px outside the zone and the toolbar beside
+/// it, never over it, so a plain region capture below already leaves both out in the common
+/// case — no window-level content-protection trick needed here, unlike macOS's window levels.
+/// `below` has no Windows equivalent (see `capture_below_other::capture`), so `0` is returned
+/// and ignored by the caller.
+#[cfg(target_os = "windows")]
 fn arrange(_app: &AppHandle, _frame: WebviewWindow, _toolbar: WebviewWindow) -> Result<u32, String> {
-    Err("scroll capture is only available on macOS".into())
+    Ok(0)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn arrange(_app: &AppHandle, _frame: WebviewWindow, _toolbar: WebviewWindow) -> Result<u32, String> {
+    Err("scroll capture is only available on macOS and Windows".into())
 }
 
 fn close_windows(app: &AppHandle) {
