@@ -63,6 +63,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_Graphics_Gdi",
+    # OCR (Fase 3): Windows.Media.Ocr sobre una imagen decodificada en memoria.
+    "Foundation",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
 ] }
 # Ya transitiva vía wry/tauri-runtime-wry a esta misma versión — declararla directamente solo
 # da acceso a sus tipos (ICoreWebView2Settings3) para desactivar los aceleradores de teclado
