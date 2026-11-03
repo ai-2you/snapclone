@@ -3,6 +3,8 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Manager, Wry,
 };
+#[cfg(windows)]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::{
     capture::{self, CaptureAction},
@@ -65,12 +67,22 @@ pub fn build(app: &AppHandle, shortcuts: &[ShortcutEntry]) -> tauri::Result<()> 
     app.manage(CaptureItems(captures));
     show_shortcuts(app, shortcuts);
 
+    // macOS convention: left click opens the menu. Windows' is the opposite — left click
+    // brings the app forward, right click (always available) opens the menu.
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("Snapclone")
         .menu(&menu)
-        .show_menu_on_left_click(true);
+        .show_menu_on_left_click(cfg!(target_os = "macos"));
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
+    }
+    #[cfg(windows)]
+    {
+        tray = tray.on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                editor_window::show(tray.app_handle(), false);
+            }
+        });
     }
     tray.build(app)?;
     Ok(())

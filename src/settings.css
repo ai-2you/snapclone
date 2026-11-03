@@ -161,3 +161,8 @@ button.shortcut-recorder[aria-pressed="true"] {
 .status.error {
   color: var(--error);
 }
+
+/* No Dock on Windows, and "only in the tray" is already the normal behaviour there. */
+body.platform-windows #dock-hidden-row {
+  display: none;
+}

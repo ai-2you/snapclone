@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import appIcon from "../src-tauri/icons/128x128@2x.png";
-import { applyPlatformClass, formatShortcut } from "./platform";
+import { IS_MAC, applyPlatformClass, formatShortcut } from "./platform";
 import { ShortcutSettings } from "./shortcut-settings";
 
 applyPlatformClass();
@@ -66,7 +66,7 @@ async function load(): Promise<void> {
   document.querySelectorAll<HTMLInputElement>("[data-toggle]").forEach((checkbox) => {
     checkbox.checked = settings[checkbox.dataset.toggle as Toggle];
   });
-  dockHidden.checked = settings.hideDockIcon;
+  if (IS_MAC) dockHidden.checked = settings.hideDockIcon;
   fileName.value = settings.defaultFileName;
   showSaveFolder(settings.saveFolder);
   showPath(document.querySelector<HTMLElement>("#history-folder")!, settings.historyFolder, "No disponible");
@@ -85,16 +85,19 @@ function bind(): void {
     });
   });
 
-  dockHidden.addEventListener("change", async () => {
-    const hidden = dockHidden.checked;
-    try {
-      await invoke("set_dock_hidden", { hidden });
-      showStatus("");
-    } catch (error) {
-      dockHidden.checked = !hidden;
-      showStatus(`No se pudo cambiar el icono del Dock: ${error}`, true);
-    }
-  });
+  // No Dock on Windows: the row is hidden in CSS, and this binds nothing there.
+  if (IS_MAC) {
+    dockHidden.addEventListener("change", async () => {
+      const hidden = dockHidden.checked;
+      try {
+        await invoke("set_dock_hidden", { hidden });
+        showStatus("");
+      } catch (error) {
+        dockHidden.checked = !hidden;
+        showStatus(`No se pudo cambiar el icono del Dock: ${error}`, true);
+      }
+    });
+  }
 
   document.querySelector<HTMLButtonElement>("#save-folder-open")!.addEventListener("click", () => {
     void run("open_save_folder", {}, "No se pudo abrir la carpeta");
