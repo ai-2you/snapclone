@@ -73,3 +73,10 @@ webview2-com = "0.39.1"
 # extensión `SetExtWindows` para excluir del Historial del portapapeles y de su sincronización
 # en la nube. Leer (Pegar) usa la API Win32 directa de arriba, no esta crate — ver Fase 5.
 arboard = "3.7.0"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# `xcap` ya trae `image` 0.25 (solo con la feature `png`); esta entrada activa `jpeg` en esa
+# MISMA copia para el resto de plataformas, sin duplicarla. Sin `tiff` a propósito (YAGNI +
+# superficie de ataque, hallazgo del red team): `FILE_FORMATS` solo acepta PNG/JPEG en ninguna
+# plataforma, así que un decodificador TIFF aquí no tendría ningún caso de uso real.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

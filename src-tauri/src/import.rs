@@ -86,7 +86,7 @@ pub(crate) fn decode_limits() -> xcap::image::Limits {
     let mut limits = xcap::image::Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
-    limits.max_alloc = Some(MAX_PIXELS * 4 + 64 * 1024 * 1024);
+    limits.max_alloc = Some(MAX_PIXELS * 4 + 256 * 1024 * 1024);
     limits
 }
 
@@ -240,13 +240,34 @@ mod native {
     };
     use xcap::image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 
-    /// Without ImageIO the PNG header check after conversion is the only one.
-    pub fn header_size(_bytes: &[u8]) -> Option<(u32, u32)> {
-        Some((1, 1))
+    /// Reads only the declared dimensions, never decoding pixels — the first line of defence
+    /// against a compression bomb, before `to_png` allocates anything (OWASP A10:2025).
+    pub fn header_size(bytes: &[u8]) -> Option<(u32, u32)> {
+        xcap::image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()
     }
 
-    pub fn to_png(_bytes: &[u8]) -> Result<Vec<u8>, String> {
-        Err("converting images is only implemented on macOS".into())
+    /// `decode_limits()` is defence in depth on top of `header_size`: it makes the decoder
+    /// itself reject a header that lied about the real image, and raises the default
+    /// `max_alloc` so a large-but-valid image does not fail for a reason the user never sees.
+    pub fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let mut reader =
+            xcap::image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|error| error.to_string())?;
+        reader.limits(super::decode_limits());
+        let image = reader.decode().map_err(|error| error.to_string())?;
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), xcap::image::ImageFormat::Png)
+            .map_err(|error| error.to_string())?;
+        Ok(png)
+    }
+
+    /// Encodes a PNG in another format; only the tests need it, to build JPEG input.
+    #[cfg(test)]
+    pub fn encode(png: &[u8], format: xcap::image::ImageFormat) -> Vec<u8> {
+        let image = xcap::image::load_from_memory(png).expect("valid PNG");
+        let mut out = Vec::new();
+        image.write_to(&mut std::io::Cursor::new(&mut out), format).expect("encodes");
+        out
     }
 
     const BAD_IMAGE: &str = "La imagen está dañada o no se puede leer";
@@ -683,12 +704,38 @@ mod tests {
         png
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn oversized_images_are_refused_from_their_header() {
         let png = wide_png(40_000);
         assert_eq!(native::header_size(&png), Some((40_000, 1)), "read from the header");
         let error = prepare(png, &ALL, "no").unwrap_err();
+        assert!(error.contains("demasiado grande"), "{error}");
+    }
+
+    #[test]
+    fn decode_limits_cover_the_largest_image_the_app_allows() {
+        let limits = decode_limits();
+        assert!(limits.max_alloc.unwrap() >= MAX_PIXELS * 4);
+        assert_eq!(limits.max_image_width, Some(MAX_SIDE));
+        assert_eq!(limits.max_image_height, Some(MAX_SIDE));
+    }
+
+    /// A real JPEG just as wide as `wide_png`'s PNG, over the JPEG decoder this phase adds for
+    /// Windows (not available on macOS, which never enables the `jpeg` feature of `image`).
+    #[cfg(not(target_os = "macos"))]
+    fn wide_jpeg(width: u32) -> Vec<u8> {
+        use xcap::image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg).encode(&vec![0u8; width as usize], width, 1, ExtendedColorType::L8).unwrap();
+        jpeg
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_oversized_jpeg_is_refused_from_its_header_too() {
+        let jpeg = wide_jpeg(40_000);
+        assert_eq!(native::header_size(&jpeg), Some((40_000, 1)), "read from the header, not a full decode");
+        let error = prepare(jpeg, &ALL, "no").unwrap_err();
         assert!(error.contains("demasiado grande"), "{error}");
     }
 
@@ -701,13 +748,23 @@ mod tests {
         assert!(check_size(20_000, 20_000).is_err());
     }
 
+    /// macOS converts JPEG and TIFF (ImageIO, unchanged); Windows only JPEG, since no path in
+    /// the app ever needs a TIFF decoder there (`FILE_FORMATS` never accepts `Format::Tiff`).
     #[cfg(target_os = "macos")]
+    fn encoded_samples(png: &[u8]) -> Vec<Vec<u8>> {
+        use objc2_app_kit::NSBitmapImageFileType;
+        vec![native::encode(png, NSBitmapImageFileType::JPEG), native::encode(png, NSBitmapImageFileType::TIFF)]
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn encoded_samples(png: &[u8]) -> Vec<Vec<u8>> {
+        vec![native::encode(png, xcap::image::ImageFormat::Jpeg)]
+    }
+
     #[test]
     fn jpeg_and_tiff_are_converted_to_png_with_their_size() {
-        use objc2_app_kit::NSBitmapImageFileType;
         let png = sample_png(64, 48);
-        for kind in [NSBitmapImageFileType::JPEG, NSBitmapImageFileType::TIFF] {
-            let encoded = native::encode(&png, kind);
+        for encoded in encoded_samples(&png) {
             let (converted, scale) = prepare(encoded, &ALL, "no").unwrap();
             assert_eq!(sniff(&converted), Some(Format::Png));
             let image = xcap::image::load_from_memory(&converted).unwrap();
