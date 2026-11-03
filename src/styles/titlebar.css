@@ -11,7 +11,12 @@
   align-items: center;
   gap: 8px;
   height: 44px;
-  padding: 0 12px 0 88px;
+  padding: 0 12px 0 88px; /* macOS: leaves room for the traffic lights */
+}
+
+/* Windows draws its own window controls natively; there is no gap to leave. */
+body.platform-windows .titlebar {
+  padding: 0 12px;
 }
 
 .tool-pills {
