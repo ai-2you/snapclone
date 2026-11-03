@@ -68,6 +68,12 @@ windows = { version = "0.62", features = [
     "Graphics_Imaging",
     "Media_Ocr",
     "Storage_Streams",
+    # Compartir/arrastrar (Fase 4): panel de compartir nativo (DataTransferManager) y el
+    # anti-auto-drop de Arrastrar (GetAsyncKeyState).
+    "ApplicationModel_DataTransfer",
+    "Storage",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 # Ya transitiva vía wry/tauri-runtime-wry a esta misma versión — declararla directamente solo
 # da acceso a sus tipos (ICoreWebView2Settings3) para desactivar los aceleradores de teclado
@@ -78,6 +84,17 @@ webview2-com = "0.39.1"
 # extensión `SetExtWindows` para excluir del Historial del portapapeles y de su sincronización
 # en la nube. Leer (Pegar) usa la API Win32 directa de arriba, no esta crate — ver Fase 5.
 arboard = "3.7.0"
+# `IIterable<IStorageItem>` (Fase 4, panel de compartir) y `.join()` sobre `IAsyncOperation`
+# (Fase 3 y 4) ya son dependencias DIRECTAS de la crate `windows` — aquí se declaran también
+# como propias solo para poder escribir `use windows_collections::...`/`use windows_future::...`
+# en este crate (Cargo no permite `use` de una dependencia transitiva). Mismas versiones que
+# `windows` 0.62.2 ya trae, cero copias nuevas.
+windows-collections = "0.3"
+windows-future = "0.3"
+# Arrastrar un archivo fuera del editor (drag-out). Trae por su cuenta `windows` 0.52 y
+# `windows-core` 0.58 (coste de supply chain aceptado, ver plan.md — no es la misma copia que
+# la entrada canónica de arriba).
+drag = "2.1.1"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # `xcap` ya trae `image` 0.25 (solo con la feature `png`); esta entrada activa `jpeg` en esa

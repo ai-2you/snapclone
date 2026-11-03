@@ -23,6 +23,8 @@ impl Anchor {
     }
 }
 
+// macOS and the generic fallback: SYNCHRONOUS, exactly as before Phase 4 (zero change here).
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 pub fn share_export(app: AppHandle, anchor: Anchor) -> Result<(), String> {
     if !anchor.is_valid() {
@@ -35,14 +37,42 @@ pub fn share_export(app: AppHandle, anchor: Anchor) -> Result<(), String> {
     { other::share(&app, &path, anchor) }
 }
 
+/// Windows is `async` on purpose (red team): `windows::share` resolves a `StorageFile` with
+/// `.join()`, forbidden on the main thread (see Phase 3), so that part runs in `spawn_blocking`
+/// and only the window-bound half (`GetForWindow`/`DataRequested`/`ShowShareUIForWindow`) jumps
+/// to the main thread via `run_on_main_thread`. Never make this synchronous again.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn share_export(app: AppHandle, anchor: Anchor) -> Result<(), String> {
+    if !anchor.is_valid() {
+        return Err("invalid share button position".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = output::export_file(&app)?;
+        // `anchor` has no Windows equivalent (`IDataTransferManagerInterop` only takes a
+        // `HWND`, no anchor rectangle); kept in the signature for parity with the other
+        // platforms, simply unused here.
+        windows::share(&app, &path, anchor)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Starts dragging the prepared file. Returns false, without an error, when the mouse button
 /// was already released: the press simply ended before the drag began.
+///
+/// SYNCHRONOUS on every platform, on purpose (opposite rule from `share_export` above): on
+/// Windows, `drag::init_ole()` pins OLE to the first thread that ever starts a drag, which must
+/// always be this same thread — making this `async` (or wrapping it in `run_on_main_thread`,
+/// which would deadlock since this already runs there) would break that guarantee.
 #[tauri::command]
 pub fn drag_export(app: AppHandle) -> Result<bool, String> {
     let path = output::export_file(&app)?;
     #[cfg(target_os = "macos")]
     { macos::drag(&app, &path) }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    { windows::drag(&app, &path) }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     { other::drag(&app, &path) }
 }
 
@@ -192,9 +222,188 @@ mod macos {
     }
 }
 
-/// Placeholder for every non-macOS platform, selected until Phase 4 adds a real `mod windows`
-/// (same `share`/`drag(app: &AppHandle, ...)` contract) and the dispatch above is extended.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::{
+        cell::RefCell,
+        panic::{AssertUnwindSafe, catch_unwind},
+        path::Path,
+        sync::{Arc, Mutex, mpsc},
+        time::Duration,
+    };
+
+    use drag::{DragItem, DragResult, Image, Options};
+    use tauri::{AppHandle, Manager};
+    use windows::{
+        ApplicationModel::DataTransfer::{DataRequestedEventArgs, DataTransferManager},
+        Foundation::TypedEventHandler,
+        Storage::{IStorageItem, StorageFile},
+        Win32::{
+            Foundation::HWND,
+            UI::{
+                Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+                Shell::IDataTransferManagerInterop,
+                WindowsAndMessaging::GetForegroundWindow,
+            },
+        },
+        core::{AgileReference, Error, HSTRING, Interface, Ref, factory},
+    };
+    use windows_collections::IIterable;
+
+    use super::Anchor;
+
+    /// Side of the image shown under the pointer while dragging, matching macOS's
+    /// `DRAG_PREVIEW_SIDE`, so a full-size scroll capture is never decoded just for a preview.
+    const DRAG_PREVIEW_SIDE: u32 = 160;
+
+    thread_local! {
+        // `GetForWindow` always returns the SAME manager for a given `HWND`: without this, a
+        // handler would be registered again on every "Compartir" click and they would pile up.
+        static ACTIVE_SHARE: RefCell<Option<(DataTransferManager, i64)>> = const { RefCell::new(None) };
+    }
+
+    fn win_msg(context: &str, error: Error) -> String {
+        format!("{context}: {} (0x{:08X})", error.message(), error.code().0 as u32)
+    }
+
+    /// Carries the resolved file across to `run_on_main_thread`: `AgileReference` and `HSTRING`
+    /// are `Send`, the `StorageFile`/`IStorageItem` they stand in for are not.
+    struct PreparedShare {
+        item: AgileReference<IStorageItem>,
+        title: HSTRING,
+    }
+
+    /// Call ONLY from a worker (`spawn_blocking`), never the main thread: this does `.join()`
+    /// (forbidden there, see Phase 3) and then waits on the main thread for the panel itself.
+    pub fn share(app: &AppHandle, path: &Path, _anchor: Anchor) -> Result<(), String> {
+        let prepared = prepare_share(path)?;
+        let (sender, receiver) = mpsc::channel();
+        let main_app = app.clone();
+        app.run_on_main_thread(move || {
+            let _ = sender.send(show_share(&main_app, prepared));
+        })
+        .map_err(|error| error.to_string())?;
+        receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| "el panel de compartir no respondió".to_string())?
+    }
+
+    /// Blocking half: `.join()` is safe here, this never runs on the main thread.
+    fn prepare_share(path: &Path) -> Result<PreparedShare, String> {
+        let file: StorageFile = StorageFile::GetFileFromPathAsync(&HSTRING::from(path))
+            .and_then(|operation| operation.join())
+            .map_err(|error| win_msg("no se pudo abrir la imagen exportada", error))?;
+        let item = file
+            .cast::<IStorageItem>()
+            .and_then(|item| AgileReference::new(&item))
+            .map_err(|error| win_msg("no se pudo preparar la imagen exportada", error))?;
+        let title = HSTRING::from(path.file_name().unwrap_or(path.as_os_str()));
+        Ok(PreparedShare { item, title })
+    }
+
+    /// Main-thread half: only ever called from inside `run_on_main_thread`.
+    fn show_share(app: &AppHandle, prepared: PreparedShare) -> Result<(), String> {
+        let PreparedShare { item, title } = prepared;
+        let window = app.get_webview_window(crate::capture::EDITOR_WINDOW).ok_or("the editor window is gone")?;
+        let hwnd: HWND = window.hwnd().map_err(|error| error.to_string())?;
+        // SAFETY: `hwnd` is the editor's live window, read on the main thread as required.
+        unsafe {
+            // Checked BEFORE registering anything (red team): failing after would leave an
+            // orphaned handler armed.
+            if GetForegroundWindow() != hwnd {
+                return Err("la ventana del editor no está en primer plano".into());
+            }
+            let interop: IDataTransferManagerInterop = factory::<DataTransferManager, IDataTransferManagerInterop>()
+                .map_err(|error| win_msg("el panel de compartir de Windows no está disponible", error))?;
+            let manager: DataTransferManager = interop
+                .GetForWindow(hwnd)
+                .map_err(|error| win_msg("el panel de compartir de Windows no está disponible", error))?;
+            ACTIVE_SHARE.with_borrow_mut(|active| {
+                if let Some((old, token)) = active.take() {
+                    let _ = old.RemoveDataRequested(token);
+                }
+            });
+            let handler = TypedEventHandler::<DataTransferManager, DataRequestedEventArgs>::new(move |_, args| {
+                // NEVER return `Err` here, nor let a panic escape: both cross WinRT's `extern`
+                // boundary and Windows may kill the whole process for it (confirmed against
+                // Chrome's own source, see the Windows port plan).
+                fill_share_request(&args, &item, &title);
+                Ok(())
+            });
+            let token =
+                manager.DataRequested(&handler).map_err(|error| win_msg("no se pudo preparar el panel de compartir", error))?;
+            ACTIVE_SHARE.with_borrow_mut(|active| *active = Some((manager, token)));
+            interop.ShowShareUIForWindow(hwnd).map_err(|error| win_msg("no se pudo abrir el panel de compartir", error))
+        }
+    }
+
+    fn fill_share_request(args: &Ref<DataRequestedEventArgs>, item: &AgileReference<IStorageItem>, title: &HSTRING) {
+        let Some(request) = args.as_ref().and_then(|args| args.Request().ok()) else { return };
+        let outcome = catch_unwind(AssertUnwindSafe(|| -> windows::core::Result<()> {
+            let data = request.Data()?;
+            data.Properties()?.SetTitle(title)?;
+            data.SetStorageItemsReadOnly(&IIterable::<IStorageItem>::from(vec![Some(item.resolve()?)]))
+        }));
+        // `Err(panic)` or `Ok(Err(hresult))`: same treatment, never propagated further.
+        if !matches!(outcome, Ok(Ok(()))) {
+            let _ = request.FailWithDisplayText(&HSTRING::from("No se pudo preparar la imagen para compartir."));
+        }
+    }
+
+    /// The left mouse button is still held down, same check as macOS's `left_button_pressed()`.
+    fn left_button_pressed() -> bool {
+        // SAFETY: a plain state query, no resources involved.
+        unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) < 0 }
+    }
+
+    /// A PNG thumbnail no larger than `DRAG_PREVIEW_SIDE` on its longest side: `drag` decodes
+    /// `Image::Raw` on the main thread before the drag starts, so a full scroll-capture-sized
+    /// PNG would stall the UI and show an oversized ghost image.
+    fn preview_image(path: &Path) -> Result<Image, String> {
+        let image = xcap::image::open(path).map_err(|error| error.to_string())?;
+        let longest = image.width().max(image.height());
+        let thumbnail = if longest > DRAG_PREVIEW_SIDE {
+            let scale = f64::from(DRAG_PREVIEW_SIDE) / f64::from(longest);
+            let width = ((f64::from(image.width()) * scale).round() as u32).max(1);
+            let height = ((f64::from(image.height()) * scale).round() as u32).max(1);
+            image.resize(width, height, xcap::image::imageops::FilterType::Lanczos3)
+        } else {
+            image
+        };
+        let mut png = Vec::new();
+        thumbnail
+            .write_to(&mut std::io::Cursor::new(&mut png), xcap::image::ImageFormat::Png)
+            .map_err(|error| error.to_string())?;
+        Ok(Image::Raw(png))
+    }
+
+    // Must keep being called from a SYNCHRONOUS command (main thread): `drag::init_ole` pins
+    // OLE to the first thread that ever drags. Never make this `async` or wrap it in
+    // `run_on_main_thread` — asymmetric to `share` above on purpose, see `drag_export`.
+    pub fn drag(app: &AppHandle, path: &Path) -> Result<bool, String> {
+        if !left_button_pressed() {
+            return Ok(false); // same as macOS: the press ended before the drag began
+        }
+        let window = app.get_webview_window(crate::capture::EDITOR_WINDOW).ok_or("the editor window is gone")?;
+        // The callback must be `Fn(...) + Send + 'static`: neither `Cell` nor `Rc` are `Send`,
+        // so the outcome is shared through an `Arc<Mutex<_>>` cloned before the closure.
+        let outcome = Arc::new(Mutex::new(DragResult::Cancel));
+        let callback_outcome = Arc::clone(&outcome);
+        drag::start_drag(
+            &window,
+            DragItem::Files(vec![path.to_path_buf()]),
+            preview_image(path)?,
+            move |result, _cursor_position| *callback_outcome.lock().unwrap() = result,
+            Options::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        // `start_drag` blocks on Windows: by the time it returns, the drag has already ended.
+        let result = *outcome.lock().unwrap();
+        Ok(matches!(result, DragResult::Dropped))
+    }
+}
+
+/// Placeholder for every platform that is neither macOS nor Windows (same `share`/
+/// `drag(app: &AppHandle, ...)` contract as the real `mod windows` below).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod other {
     use std::path::Path;
 

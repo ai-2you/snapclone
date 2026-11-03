@@ -153,9 +153,22 @@ pub fn open_file_dialog(app: &AppHandle) {
 /// Files dropped on the editor; the system gives the paths. Only the first one is opened,
 /// since the editor shows one capture at a time.
 pub fn open_dropped(app: &AppHandle, paths: &[PathBuf]) {
-    if let Some(path) = paths.first() {
-        open_path(app, path.clone());
+    let Some(path) = paths.first() else { return };
+    #[cfg(not(target_os = "macos"))]
+    if is_own_export(app, path) {
+        // A "flick" too quick for `drag_export` to see the button still down starts
+        // `DoDragDrop` with it already released, so the drop lands back on the very window
+        // that started the drag — never treat that as a real import (Windows only).
+        return;
     }
+    open_path(app, path.clone());
+}
+
+/// Whether `path` is inside this app's own export folder (`output::export_root`) — the only way
+/// a dropped path can land there is a drag the app itself just started.
+#[cfg(not(target_os = "macos"))]
+fn is_own_export(app: &AppHandle, path: &Path) -> bool {
+    crate::output::export_root(app).is_ok_and(|root| path.starts_with(root))
 }
 
 #[tauri::command]

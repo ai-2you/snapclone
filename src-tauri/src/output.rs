@@ -200,7 +200,7 @@ pub fn send_feedback() -> Result<(), String> {
     if status.success() { Ok(()) } else { Err("no hay ninguna app de correo configurada".into()) }
 }
 
-fn export_root(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn export_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app.path().app_cache_dir().map_err(|error| error.to_string())?.join(EXPORT_DIR))
 }
 
