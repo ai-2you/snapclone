@@ -27,6 +27,8 @@ mod shortcuts;
 mod stitch;
 mod tray;
 mod wallpaper;
+#[cfg(windows)]
+mod webview_keys;
 
 use tauri::{DragDropEvent, Manager, RunEvent, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
@@ -143,6 +145,12 @@ pub fn run() {
             output::clean_exports(app.handle());
             #[cfg(target_os = "macos")]
             app.set_activation_policy(editor_window::activation_policy(editor_window::dock_hidden(app.handle())));
+            // The editor is the only window declared statically in tauri.conf.json rather than
+            // built in Rust, so it is the only one that needs this called explicitly here.
+            #[cfg(windows)]
+            if let Some(editor) = app.get_webview_window(capture::EDITOR_WINDOW) {
+                webview_keys::disable_browser_accelerator_keys(&editor);
+            }
             let registered = shortcuts::init(app.handle());
             tray::build(app.handle(), &registered)?;
             // Without it, the editor's buttons and the menu bar icon still offer every action.

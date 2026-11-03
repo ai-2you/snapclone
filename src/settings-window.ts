@@ -1,7 +1,10 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import appIcon from "../src-tauri/icons/128x128@2x.png";
+import { applyPlatformClass, formatShortcut } from "./platform";
 import { ShortcutSettings } from "./shortcut-settings";
+
+applyPlatformClass();
 
 /** As Rust reports them in one call (see `app_settings.rs`). */
 type AppSettings = {
@@ -18,7 +21,7 @@ type Toggle = "soundOn" | "closeAfterCopy" | "hideWindowsOnCapture";
 
 /** Heard by the editor, which names the zone shortcut while it is empty. */
 const SHORTCUTS_CHANGED = "shortcuts-changed";
-const NO_SAVE_FOLDER = "Sin elegir: se preguntará al guardar con ⌘S";
+const NO_SAVE_FOLDER = `Sin elegir: se preguntará al guardar con ${formatShortcut("S")}`;
 
 const status = document.querySelector<HTMLElement>("#settings-status")!;
 const saveFolder = document.querySelector<HTMLElement>("#save-folder")!;

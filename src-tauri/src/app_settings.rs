@@ -95,8 +95,12 @@ pub fn open(app: &AppHandle) {
         .maximizable(false)
         .center()
         .build();
-    if let Err(error) = built {
-        editor_window::notify(app, &format!("No se pudieron abrir los ajustes: {error}"), true);
+    match built {
+        #[cfg(windows)]
+        Ok(window) => crate::webview_keys::disable_browser_accelerator_keys(&window),
+        #[cfg(not(windows))]
+        Ok(_) => {}
+        Err(error) => editor_window::notify(app, &format!("No se pudieron abrir los ajustes: {error}"), true),
     }
 }
 

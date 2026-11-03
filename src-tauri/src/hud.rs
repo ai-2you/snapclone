@@ -83,6 +83,8 @@ fn open(app: &AppHandle, label: &str) -> Result<WebviewWindow, String> {
         crate::selector::place_physical(&window, spot.x, spot.y, spot.width, spot.height).map_err(|error| error.to_string())?;
     }
     window.set_ignore_cursor_events(true).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    crate::webview_keys::disable_browser_accelerator_keys(&window);
     raise(app, window.clone());
     Ok(window)
 }

@@ -128,6 +128,10 @@ fn open_windows(app: &AppHandle, framed: Rect, toolbar: Rect) -> Result<u32, Str
     let bar = builder(app, TOOLBAR_WINDOW, toolbar).accept_first_mouse(true).build().map_err(|error| error.to_string())?;
     #[cfg(not(target_os = "macos"))]
     crate::selector::place_physical(&bar, toolbar.x, toolbar.y, toolbar.width, toolbar.height).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    for window in [&frame, &bar] {
+        crate::webview_keys::disable_browser_accelerator_keys(window);
+    }
     arrange(app, frame, bar)
 }
 

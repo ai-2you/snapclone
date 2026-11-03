@@ -3833,6 +3833,7 @@ dependencies = [
  "tauri-plugin-store",
  "tokio",
  "uuid",
+ "webview2-com",
  "windows",
  "xcap",
 ]

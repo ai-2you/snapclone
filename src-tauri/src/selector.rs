@@ -215,6 +215,8 @@ fn open_overlay(app: &AppHandle, index: usize, x: i32, y: i32, width: u32, heigh
     let window = builder.build()?;
     #[cfg(not(target_os = "macos"))]
     place_physical(&window, x, y, width, height)?;
+    #[cfg(windows)]
+    crate::webview_keys::disable_browser_accelerator_keys(&window);
     raise_above_menu_bar(app, window);
     Ok(())
 }
