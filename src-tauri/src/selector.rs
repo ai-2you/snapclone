@@ -413,6 +413,7 @@ fn start_scroll(app: &AppHandle, session: Session, index: usize, rect: Rect) -> 
                     monitor: bounds(shot),
                     zone: geometry::Rect::new(x as i32, y as i32, width, height),
                     others: others.collect(),
+                    scale: shot.scale(),
                 },
             )
         });

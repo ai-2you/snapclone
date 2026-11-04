@@ -241,9 +241,9 @@ mod windows {
         Win32::{
             Foundation::HWND,
             UI::{
-                Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+                Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON},
                 Shell::IDataTransferManagerInterop,
-                WindowsAndMessaging::GetForegroundWindow,
+                WindowsAndMessaging::{GetForegroundWindow, GetSystemMetrics, SM_SWAPBUTTON},
             },
         },
         core::{AgileReference, Error, HSTRING, Interface, Ref, factory},
@@ -322,9 +322,13 @@ mod windows {
                 }
             });
             let handler = TypedEventHandler::<DataTransferManager, DataRequestedEventArgs>::new(move |_, args| {
-                // NEVER return `Err` here, nor let a panic escape: both cross WinRT's `extern`
-                // boundary and Windows may kill the whole process for it (confirmed against
-                // Chrome's own source, see the Windows port plan).
+                // NEVER return `Err` here: that crosses WinRT's `extern` boundary and Windows
+                // may kill the whole process for it (confirmed against Chrome's own source, see
+                // the Windows port plan). `fill_share_request`'s own `catch_unwind` keeps a panic
+                // from doing the same thing — but ONLY in a dev build: this crate's release
+                // profile sets `panic = "abort"` (Cargo.toml), which aborts the process before
+                // unwinding even starts, so `catch_unwind` never runs there. It is a real
+                // diagnostic safety net for dev, not a release-time guarantee.
                 fill_share_request(&args, &item, &title);
                 Ok(())
             });
@@ -348,26 +352,36 @@ mod windows {
         }
     }
 
-    /// The left mouse button is still held down, same check as macOS's `left_button_pressed()`.
+    /// The PRIMARY (logical "select") mouse button is still held down, same intent as macOS's
+    /// `left_button_pressed()`. `GetAsyncKeyState` reports the PHYSICAL button regardless of the
+    /// user's "switch primary and secondary buttons" setting (confirmed against Microsoft's own
+    /// docs for `VK_LBUTTON`), so for a left-handed user whose buttons are swapped, checking
+    /// `VK_LBUTTON` alone would watch the wrong (now-secondary) physical button.
     fn left_button_pressed() -> bool {
-        // SAFETY: a plain state query, no resources involved.
-        unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) < 0 }
+        // SAFETY: plain state queries, no resources involved.
+        unsafe {
+            let primary = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { VK_RBUTTON } else { VK_LBUTTON };
+            GetAsyncKeyState(i32::from(primary.0)) < 0
+        }
     }
 
     /// A PNG thumbnail no larger than `DRAG_PREVIEW_SIDE` on its longest side: `drag` decodes
     /// `Image::Raw` on the main thread before the drag starts, so a full scroll-capture-sized
     /// PNG would stall the UI and show an oversized ghost image.
     fn preview_image(path: &Path) -> Result<Image, String> {
-        let image = xcap::image::open(path).map_err(|error| error.to_string())?;
+        // `xcap::image::open` decodes under the crate's default 512MiB `max_alloc`, which a
+        // scroll capture's own export can exceed — the same reason `export.rs::decode_rgba`
+        // reads this file's bytes through `decode_limits()` instead of a convenience opener.
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let mut reader =
+            xcap::image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|error| error.to_string())?;
+        reader.limits(crate::import::decode_limits());
+        let image = reader.decode().map_err(|error| error.to_string())?;
         let longest = image.width().max(image.height());
-        let thumbnail = if longest > DRAG_PREVIEW_SIDE {
-            let scale = f64::from(DRAG_PREVIEW_SIDE) / f64::from(longest);
-            let width = ((f64::from(image.width()) * scale).round() as u32).max(1);
-            let height = ((f64::from(image.height()) * scale).round() as u32).max(1);
-            image.resize(width, height, xcap::image::imageops::FilterType::Lanczos3)
-        } else {
-            image
-        };
+        // `.thumbnail()` (fast integer box filter) rather than `.resize(..., Lanczos3)`: this
+        // whole function runs on the main thread before the drag starts, and Lanczos3 on a
+        // scroll-capture-sized image is slow enough to visibly stall the UI for a mere preview.
+        let thumbnail = if longest > DRAG_PREVIEW_SIDE { image.thumbnail(DRAG_PREVIEW_SIDE, DRAG_PREVIEW_SIDE) } else { image };
         let mut png = Vec::new();
         thumbnail
             .write_to(&mut std::io::Cursor::new(&mut png), xcap::image::ImageFormat::Png)
@@ -383,6 +397,13 @@ mod windows {
             return Ok(false); // same as macOS: the press ended before the drag began
         }
         let window = app.get_webview_window(crate::capture::EDITOR_WINDOW).ok_or("the editor window is gone")?;
+        let preview = preview_image(path)?;
+        // Decoding/thumbnailing above can take a moment on a large capture: re-check that the
+        // button is still down, in case the press already ended while that was running — same
+        // reasoning as the check at the top of this function, just after the one slow step.
+        if !left_button_pressed() {
+            return Ok(false);
+        }
         // The callback must be `Fn(...) + Send + 'static`: neither `Cell` nor `Rc` are `Send`,
         // so the outcome is shared through an `Arc<Mutex<_>>` cloned before the closure.
         let outcome = Arc::new(Mutex::new(DragResult::Cancel));
@@ -390,7 +411,7 @@ mod windows {
         drag::start_drag(
             &window,
             DragItem::Files(vec![path.to_path_buf()]),
-            preview_image(path)?,
+            preview,
             move |result, _cursor_position| *callback_outcome.lock().unwrap() = result,
             Options::default(),
         )

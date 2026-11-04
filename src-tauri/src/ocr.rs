@@ -468,12 +468,19 @@ mod vision {
 
     pub fn recognize(path: &Path) -> Result<Recognized, String> {
         let png = std::fs::read(path).map_err(|error| format!("No se pudo leer la captura: {error}"))?;
-        // Any failure here means no OCR language pack is installed — confirmed empirically,
-        // not documented: it comes back as a plain error, never a panic.
-        let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|_| {
-            "Windows no tiene instalado el reconocimiento de texto para tu idioma. Añádelo en \
-             Configuración › Hora e idioma › Idioma y región › (tu idioma) › Opciones de idioma."
-                .to_string()
+        // `TryCreateFromUserProfileLanguages` returns this exact sentinel error (a null engine
+        // pointer with no real HRESULT, confirmed by reading `windows-core`'s `Type::from_abi`)
+        // specifically when no OCR language pack is installed. Any OTHER error — COM not
+        // initialized, RPC failure, etc. — is a real failure and must not be masked by that
+        // message, or a genuine bug would always look like a missing language pack.
+        let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| {
+            if error == windows::core::Error::empty() {
+                "Windows no tiene instalado el reconocimiento de texto para tu idioma. Añádelo en \
+                 Configuración › Hora e idioma › Idioma y región › (tu idioma) › Opciones de idioma."
+                    .to_string()
+            } else {
+                ocr_error(error)
+            }
         })?;
         let max = OcrEngine::MaxImageDimension().map_err(ocr_error)?;
 
@@ -484,10 +491,15 @@ mod vision {
         let short = width.min(height);
 
         let mut recognized = Recognized { lines: Vec::new(), sensitive: Vec::new() };
-        if long <= max || short > max {
-            // Either it already fits, or both sides are too large and only a uniform rescale is
-            // left (banding only ever helps the single long side that is too large).
-            let scaled = (short > max).then(|| {
+        // Banding only preserves whole lines when the split runs along height: a line's height
+        // is bounded by its font size, comfortably inside `BAND_OVERLAP`, but its WIDTH is not —
+        // a long sentence, or a card number, could straddle a vertical seam with neither half
+        // recognized whole, which would silently defeat auto-redaction (a real security gap,
+        // not just a quality one). So a wide image (width the long side) is always rescaled,
+        // same as "both sides too large" below, even though that costs some small-text legibility.
+        let along_width = width >= height;
+        if long <= max || short > max || along_width {
+            let scaled = (long > max).then(|| {
                 let scale = f64::from(max) / f64::from(long);
                 (((f64::from(width) * scale).round() as u32).max(1), ((f64::from(height) * scale).round() as u32).max(1))
             });
@@ -498,26 +510,18 @@ mod vision {
                 push_line(&mut recognized, line, 0.0, 0.0, f64::from(analyzed_width), f64::from(analyzed_height));
             }
         } else {
-            // Only the long side is too large: band across it, full extent of the short side,
-            // never rescaled, so small text stays legible (see Key Insights in the plan).
-            let along_width = width >= height;
+            // Only height (the long side) is too large: band across it, full width, never
+            // rescaled, so small text stays legible (see Key Insights in the plan).
             for band in bands(long, max, BAND_OVERLAP) {
-                let bounds = if along_width {
-                    BitmapBounds { X: band.start, Y: 0, Width: band.end - band.start, Height: height }
-                } else {
-                    BitmapBounds { X: 0, Y: band.start, Width: width, Height: band.end - band.start }
-                };
+                let bounds = BitmapBounds { X: 0, Y: band.start, Width: width, Height: band.end - band.start };
                 let bitmap = software_bitmap(&decode(&png)?, bounds, None)?;
                 for line in ocr_lines(&engine, &bitmap)? {
-                    let (local_start, local_end) =
-                        if along_width { (line.rect.X, line.rect.X + line.rect.Width) } else { (line.rect.Y, line.rect.Y + line.rect.Height) };
-                    let top = band.start + local_start.round().max(0.0) as u32;
-                    let bottom = band.start + local_end.round().max(0.0) as u32;
+                    let top = band.start + line.rect.Y.round().max(0.0) as u32;
+                    let bottom = band.start + (line.rect.Y + line.rect.Height).round().max(0.0) as u32;
                     if !keep_line(&band, top, bottom, long) {
                         continue;
                     }
-                    let (offset_x, offset_y) = if along_width { (f64::from(band.start), 0.0) } else { (0.0, f64::from(band.start)) };
-                    push_line(&mut recognized, line, offset_x, offset_y, f64::from(width), f64::from(height));
+                    push_line(&mut recognized, line, 0.0, f64::from(band.start), f64::from(width), f64::from(height));
                 }
             }
         }

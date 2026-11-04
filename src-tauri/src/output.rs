@@ -95,7 +95,12 @@ fn avoid_reserved_name(stem: String) -> String {
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
         "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    if RESERVED.iter().any(|name| name.eq_ignore_ascii_case(&stem)) { format!("_{stem}") } else { stem }
+    // Windows checks the device name against everything up to the FIRST dot, not the whole
+    // name: "NUL.txt" and "nul.backup-1" redirect to the device exactly like bare "NUL" does,
+    // so a pattern containing a literal dot (e.g. "{uuid}.NUL" expands fine, but "NUL.{uuid}"
+    // would not) has to be checked the same way, not just an exact match on the full stem.
+    let device = stem.split('.').next().unwrap_or(&stem);
+    if RESERVED.iter().any(|name| name.eq_ignore_ascii_case(device)) { format!("_{stem}") } else { stem }
 }
 
 fn default_file_name(app: &AppHandle, datetime: &str) -> String {
@@ -118,9 +123,27 @@ pub fn unique_path(dir: &Path, name: &str, exists: impl Fn(&Path) -> bool) -> Re
         .ok_or_else(|| format!("there are already too many files named {name}"))
 }
 
+/// Whether `path` is safe to probe locally at all. On Windows this must run BEFORE any
+/// filesystem call on a path that was not just chosen fresh in a dialog (read back from
+/// settings, or remembered from an earlier save): `.is_dir()`/`.exists()` on a UNC path
+/// authenticates over SMB against whatever server it names, same as the shell calls
+/// `open_in_finder` itself refuses — checking only there is too late, since every caller of
+/// `save_folder`/`reveal_saved` already probed the path before `open_in_finder` ever ran.
+#[cfg(target_os = "windows")]
+fn is_locally_checkable(path: &Path) -> bool {
+    !windows::is_unc_path(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_locally_checkable(_path: &Path) -> bool {
+    true
+}
+
 /// The remembered folder, if it is still there.
 pub fn save_folder(app: &AppHandle) -> Option<PathBuf> {
-    prefs::read::<String>(app, SAVE_FOLDER_KEY).map(PathBuf::from).filter(|path| path.is_dir())
+    prefs::read::<String>(app, SAVE_FOLDER_KEY)
+        .map(PathBuf::from)
+        .filter(|path| is_locally_checkable(path) && path.is_dir())
 }
 
 /// Asks for a folder with the system dialog and remembers it. `None` when cancelled.
@@ -190,7 +213,7 @@ pub fn remember_saved(app: &AppHandle, path: PathBuf) {
 /// "Abrir en el Finder": the last saved file, selected, or else the save folder.
 #[tauri::command]
 pub fn reveal_saved(app: AppHandle, last: State<'_, LastSaved>) -> Result<(), String> {
-    let saved = last.0.lock().unwrap().clone().filter(|path| path.exists());
+    let saved = last.0.lock().unwrap().clone().filter(|path| is_locally_checkable(path) && path.exists());
     match (saved, save_folder(&app)) {
         (Some(file), _) => open_in_finder(&file, true),
         (None, Some(folder)) => open_in_finder(&folder, false),
@@ -475,6 +498,7 @@ mod tests {
         assert_eq!(file_stem("con", WHEN, "u"), "_con");
         assert_eq!(file_stem("COM1", WHEN, "u"), "_COM1");
         assert_eq!(file_stem("CONSOLE", WHEN, "u"), "CONSOLE", "not an exact reserved name");
+        assert_eq!(file_stem("NUL.txt", WHEN, "u"), "_NUL.txt", "reserved up to the first dot too");
     }
 
     #[test]
