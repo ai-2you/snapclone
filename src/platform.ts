@@ -2,6 +2,17 @@
  * this needs no round-trip to Rust. */
 export const IS_MAC = navigator.userAgent.includes("Mac");
 
+/**
+ * Where Rust's `capture://` custom protocol (registered in `lib.rs`) is actually reachable
+ * from the webview. WKWebView (macOS) routes the scheme itself, `capture://localhost/...`, to
+ * the registered handler — but WebView2 (Windows) does not support arbitrary custom schemes
+ * that way: Tauri instead serves them as `http://capture.localhost/...` there (the same
+ * platform split its own Rust-side `convert_file_src`/JS `convertFileSrc` document). Using the
+ * macOS form on Windows makes the webview treat it as an unknown scheme, so the request never
+ * reaches the handler and `<img>.decode()` fails with "the source image cannot be decoded".
+ */
+export const CAPTURE_ORIGIN = IS_MAC ? "capture://localhost" : "http://capture.localhost";
+
 /** The app's "primary" shortcut modifier: ⌘ on macOS, Ctrl on Windows. */
 export function isPrimaryModifier(event: KeyboardEvent | MouseEvent): boolean {
   return IS_MAC ? event.metaKey : event.ctrlKey;
