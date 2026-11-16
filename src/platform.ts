@@ -2,6 +2,9 @@
  * this needs no round-trip to Rust. */
 export const IS_MAC = navigator.userAgent.includes("Mac");
 
+/** Windows only: any other non-Mac system (Linux) keeps the macOS-style custom-protocol URLs. */
+export const IS_WINDOWS = navigator.userAgent.includes("Windows");
+
 /**
  * Where Rust's `capture://` custom protocol (registered in `lib.rs`) is actually reachable
  * from the webview. WKWebView (macOS) routes the scheme itself, `capture://localhost/...`, to
@@ -11,7 +14,7 @@ export const IS_MAC = navigator.userAgent.includes("Mac");
  * macOS form on Windows makes the webview treat it as an unknown scheme, so the request never
  * reaches the handler and `<img>.decode()` fails with "the source image cannot be decoded".
  */
-export const CAPTURE_ORIGIN = IS_MAC ? "capture://localhost" : "http://capture.localhost";
+export const CAPTURE_ORIGIN = IS_WINDOWS ? "http://capture.localhost" : "capture://localhost";
 
 /** The app's "primary" shortcut modifier: ⌘ on macOS, Ctrl on Windows. */
 export function isPrimaryModifier(event: KeyboardEvent | MouseEvent): boolean {
@@ -43,5 +46,5 @@ export function formatShortcut(key: string, mods: { shift?: boolean; alt?: boole
  * tell the two apart in CSS. Call once, as early as possible in each page's entry script.
  */
 export function applyPlatformClass(body: HTMLElement = document.body): void {
-  body.classList.add(IS_MAC ? "platform-mac" : "platform-windows");
+  body.classList.add(IS_MAC ? "platform-mac" : IS_WINDOWS ? "platform-windows" : "platform-other");
 }

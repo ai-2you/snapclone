@@ -25,8 +25,10 @@ const RESERVED: &[(Modifiers, Code)] = &[
 ];
 /// Win+Shift+S opens Windows' own Snipping Tool ("Recortes"), which Snapclone's defaults must
 /// never collide with.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 const RESERVED: &[(Modifiers, Code)] = &[(Modifiers::SUPER.union(Modifiers::SHIFT), Code::KeyS)];
+#[cfg(not(any(target_os = "macos", windows)))]
+const RESERVED: &[(Modifiers, Code)] = &[];
 /// Canonical stored/menu-accelerator names (2nd column) are never changed on any platform:
 /// changing them would break `parse(canonical(x)) == x` and every saved shortcut. Only the
 /// visible `label()` differs per platform (see below), and it does NOT read this 3rd column on
@@ -462,7 +464,7 @@ mod tests {
         assert!(validate(CaptureAction::Region, &shortcut("Cmd+Alt+Digit3"), &defaults()).is_ok());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     #[test]
     fn snipping_tool_shortcut_is_reserved_on_windows() {
         let error = validate(CaptureAction::Region, &shortcut("Cmd+Shift+KeyS"), &defaults()).unwrap_err();

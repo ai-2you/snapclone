@@ -191,3 +191,6 @@ pub fn play_capture_sound(app: &AppHandle) {
         eprintln!("capture sound could not be played");
     }
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn play_capture_sound(_app: &AppHandle) {}

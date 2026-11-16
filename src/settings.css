@@ -162,7 +162,8 @@ button.shortcut-recorder[aria-pressed="true"] {
   color: var(--error);
 }
 
-/* No Dock on Windows, and "only in the tray" is already the normal behaviour there. */
-body.platform-windows #dock-hidden-row {
+/* The Dock only exists on macOS; elsewhere "only in the tray" is already the normal behaviour. */
+body.platform-windows #dock-hidden-row,
+body.platform-other #dock-hidden-row {
   display: none;
 }

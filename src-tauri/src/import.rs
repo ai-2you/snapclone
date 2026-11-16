@@ -161,7 +161,7 @@ pub fn open_file_dialog(app: &AppHandle) {
 /// since the editor shows one capture at a time.
 pub fn open_dropped(app: &AppHandle, paths: &[PathBuf]) {
     let Some(path) = paths.first() else { return };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     if is_own_export(app, path) {
         // A "flick" too quick for `drag_export` to see the button still down starts
         // `DoDragDrop` with it already released, so the drop lands back on the very window
@@ -173,7 +173,7 @@ pub fn open_dropped(app: &AppHandle, paths: &[PathBuf]) {
 
 /// Whether `path` is inside this app's own export folder (`output::export_root`) — the only way
 /// a dropped path can land there is a drag the app itself just started.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn is_own_export(app: &AppHandle, path: &Path) -> bool {
     crate::output::export_root(app).is_ok_and(|root| path.starts_with(root))
 }
@@ -742,7 +742,7 @@ mod tests {
 
     /// A real JPEG just as wide as `wide_png`'s PNG, over the JPEG decoder this phase adds for
     /// Windows (not available on macOS, which never enables the `jpeg` feature of `image`).
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     fn wide_jpeg(width: u32) -> Vec<u8> {
         use xcap::image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
         let mut jpeg = Vec::new();
@@ -750,7 +750,7 @@ mod tests {
         jpeg
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     #[test]
     fn an_oversized_jpeg_is_refused_from_its_header_too() {
         let jpeg = wide_jpeg(40_000);
@@ -776,9 +776,14 @@ mod tests {
         vec![native::encode(png, NSBitmapImageFileType::JPEG), native::encode(png, NSBitmapImageFileType::TIFF)]
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     fn encoded_samples(png: &[u8]) -> Vec<Vec<u8>> {
         vec![native::encode(png, xcap::image::ImageFormat::Jpeg)]
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn encoded_samples(_png: &[u8]) -> Vec<Vec<u8>> {
+        Vec::new()
     }
 
     #[test]
