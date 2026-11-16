@@ -23,10 +23,18 @@ pub struct PendingSave(Mutex<Option<PathBuf>>);
 #[tauri::command]
 pub fn copy_png(app: tauri::AppHandle, request: Request<'_>) -> Result<(), String> {
     write_png_to_pasteboard(raw_body(&request)?)?;
-    if app_settings::toggle(&app, Toggle::CloseAfterCopy) {
-        editor_window::hide(&app);
-    }
+    close_after_copy(&app);
     Ok(())
+}
+
+/// Hides the editor when "Cerrar la captura después de copiarla" is on; returns whether it
+/// did. Shared by the editor's copy and the one Rust makes for "Capturar zona y copiar".
+pub fn close_after_copy(app: &tauri::AppHandle) -> bool {
+    let close = app_settings::toggle(app, Toggle::CloseAfterCopy);
+    if close {
+        editor_window::hide(app);
+    }
+    close
 }
 
 /// Windows needs its own PNG → RGBA decode before the pasteboard accepts it (`arboard` takes
@@ -41,13 +49,11 @@ pub async fn copy_png(app: tauri::AppHandle, request: Request<'_>) -> Result<(),
     let generation = app.state::<CopyGeneration>().next.fetch_add(1, Ordering::SeqCst);
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        write_png_to_pasteboard(&worker_app.state::<CopyGeneration>(), generation, &bytes)
+        write_png_in_order(&worker_app.state::<CopyGeneration>(), generation, &bytes)
     })
     .await
     .map_err(|error| error.to_string())??;
-    if app_settings::toggle(&app, Toggle::CloseAfterCopy) {
-        editor_window::hide(&app);
-    }
+    close_after_copy(&app);
     Ok(())
 }
 
@@ -85,8 +91,9 @@ pub async fn save_image(app: tauri::AppHandle, pending: State<'_, PendingSave>, 
     Ok(())
 }
 
+/// Replaces the pasteboard contents with a PNG. Call it on the main thread.
 #[cfg(target_os = "macos")]
-fn write_png_to_pasteboard(bytes: &[u8]) -> Result<(), String> {
+pub fn write_png_to_pasteboard(bytes: &[u8]) -> Result<(), String> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
     use objc2_foundation::NSData;
 
@@ -148,7 +155,7 @@ fn decode_rgba(bytes: &[u8]) -> Result<xcap::image::RgbaImage, String> {
 /// as-is for the `"PNG"` clipboard format (no re-encode); it is also decoded once for the
 /// `CF_DIBV5` fallback that apps without PNG support (Word, Paint) read instead.
 #[cfg(target_os = "windows")]
-fn write_png_to_pasteboard(state: &CopyGeneration, generation: u64, png: &[u8]) -> Result<(), String> {
+fn write_png_in_order(state: &CopyGeneration, generation: u64, png: &[u8]) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     // Cheap check before paying for decode/DIB conversion: if a newer copy already started
     // (common when the user copies several captures in quick succession), this one is already
@@ -188,9 +195,11 @@ pub fn write_text_to_pasteboard(_text: &str) -> Result<(), String> {
     Err("copying text is only implemented on macOS and Windows".into())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn write_png_to_pasteboard(_bytes: &[u8]) -> Result<(), String> {
-    Err("copying images is only implemented on macOS and Windows".into())
+/// Only macOS calls this (`native_copy`'s native route is macOS-only); Windows copies through
+/// `copy_png`, which orders concurrent writes, so there is nothing to do here elsewhere.
+#[cfg(not(target_os = "macos"))]
+pub fn write_png_to_pasteboard(_bytes: &[u8]) -> Result<(), String> {
+    Err("copying images is only implemented on macOS".into())
 }
 
 /// Writes an image to the Windows clipboard directly, bypassing `arboard` for this one format.
